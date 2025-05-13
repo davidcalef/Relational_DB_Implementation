@@ -28,7 +28,7 @@ con <- dbConnect(
   host = "sql5.freemysqlhosting.net",
   port = 3306,
   user = "sql5715249",
-  password = "wtXbqr9Yrb"
+  password = ""
 )
 
 # Drop existing tables for a clean start every code run

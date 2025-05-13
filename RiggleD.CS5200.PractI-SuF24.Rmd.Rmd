@@ -1,0 +1,502 @@
+---
+title: "Analysis of Wildlife Strikes to Aircraft"
+author: "David C Riggle riggle.d@northeastern.edu"
+date: "Summer Full 2024"
+output:
+  html_document:
+    df_print: paged
+subtitle: Practicum I CS5200
+---
+
+## task 3: Drop Existing Tables & connect to DB
+```{r connect&dropTables, echo=FALSE, warning=FALSE, message=FALSE, results="hide"}
+
+# Load libraries
+if (!requireNamespace("DBI", quietly = TRUE)) {
+  install.packages("DBI")
+}
+if (!requireNamespace("RMySQL", quietly = TRUE)) {
+  install.packages("RMySQL")
+}
+library(DBI)
+library(RMySQL)
+
+# Connect to database
+con <- dbConnect(
+  RMySQL::MySQL(),
+  dbname = "sql5715249",
+  host = "sql5.freemysqlhosting.net",
+  port = 3306,
+  user = "sql5715249",
+  password = "wtXbqr9Yrb"
+)
+
+# Drop existing tables for a clean start every code run
+dbExecute(con, "DROP TABLE IF EXISTS incidents")
+dbExecute(con, "DROP TABLE IF EXISTS flights")
+dbExecute(con, "DROP TABLE IF EXISTS conditions")
+dbExecute(con, "DROP TABLE IF EXISTS airports")
+```
+## Task 4: Create Database Schema
+
+```{r createDatabaseSchema, echo=FALSE, warning=FALSE, message=FALSE, results="hide"}
+
+# Task 4 B: create an airports table
+create_airports_table <- "
+CREATE TABLE IF NOT EXISTS airports (
+  aid INT PRIMARY KEY AUTO_INCREMENT,
+  airportName TEXT,
+  airportState TEXT,
+  airportCode VARCHAR(10) DEFAULT 'ZZZ'
+);
+"
+
+# Task 4 A & C: create flights table and link to Airports
+create_flights_table <- "
+CREATE TABLE IF NOT EXISTS flights (
+  fid INT PRIMARY KEY AUTO_INCREMENT,
+  date DATE,
+  originAirport INT,
+  airlineName TEXT,
+  aircraftType TEXT,
+  isHeavy BOOLEAN,
+  FOREIGN KEY (originAirport) REFERENCES airports(aid)
+);
+"
+
+# Task 4D Lookup Table Conditions:
+create_conditions_table <- "
+CREATE TABLE IF NOT EXISTS conditions (
+  cid INT PRIMARY KEY AUTO_INCREMENT,
+  sky_condition TEXT,
+  explanation TEXT
+);
+"
+
+# Task 4E:create wildlife strikes incident table
+# Task 4F: incidents & flights lined w/ForeignKeys
+create_incidents_table <- "
+CREATE TABLE IF NOT EXISTS incidents (
+  iid INT PRIMARY KEY AUTO_INCREMENT,
+  fid INT,
+  wlsize TEXT,
+  impact TEXT,
+  altitude INT CHECK (altitude >= 0),
+  conditions INT,
+  FOREIGN KEY (fid) REFERENCES flights(fid),
+  FOREIGN KEY (conditions) REFERENCES conditions(cid)
+);
+"
+
+# Execute the SQL statements
+dbExecute(con, create_airports_table)
+dbExecute(con, create_flights_table)
+dbExecute(con, create_conditions_table)
+dbExecute(con, create_incidents_table)
+
+```
+## 4G.Tests
+```{r task4g_tests, eval = T, echo=FALSE, warning = F}
+
+# Test the flights table
+flights_structure <- dbGetQuery(con, "DESCRIBE flights")
+print(flights_structure)
+# Test the airports table
+airports_structure <- dbGetQuery(con, "DESCRIBE airports")
+print(airports_structure)
+# Test the conditions table
+conditions_structure <- dbGetQuery(con, "DESCRIBE conditions")
+print(conditions_structure)
+# Test the incidents table
+incidents_structure <- dbGetQuery(con, "DESCRIBE incidents")
+print(incidents_structure)
+
+```
+
+## Task 5: Load Bird Strikes Data
+```{r loadBirdStrikesData, echo=FALSE, warning=FALSE, message=FALSE}
+# Load the bird strikes CSV data into a dataframe
+bds.raw <- read.csv("BirdStrikesData-V4-SuF24.csv")
+```
+
+## Task 6: Populate the Tables with Data
+```{r task6_populate_tables, echo=FALSE, warning=FALSE, message=FALSE}
+
+## Load date handling libraries
+if (!requireNamespace("lubridate", quietly = TRUE)) {
+  install.packages("lubridate")
+}
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+  install.packages("dplyr")
+}
+library(lubridate)
+library(dplyr)
+
+## Function to insert sentinel entries for "Unknown" airport
+insert_sentinel_entries <- function() {
+  unknown_airport <- data.frame(airportName = "Unknown", airportState = "Unknown", airportCode = "ZZZ")
+  dbWriteTable(con, "airports", unknown_airport, append = TRUE, row.names = FALSE)
+  
+  unknown_airline <- data.frame(airlineName = "Unknown")
+  dbWriteTable(con, "flights", unknown_airline, append = TRUE, row.names = FALSE)
+  
+  unknown_airport_id <- dbGetQuery(con, "SELECT aid FROM airports WHERE airportName = 'Unknown'")
+  return(unknown_airport_id$aid[1])
+}
+
+## Insert sentinel entries and get the unknown airport ID
+unknown_airport_id <- insert_sentinel_entries()
+
+## Function to insert data into the airports table with bulk insert/ dbWriteTable
+insert_airports <- function(data) {
+  unique_airports <- unique(data %>% select(dep_airport, origin_state) %>% mutate(airportCode = "ZZZ"))
+  colnames(unique_airports) <- c("airportName", "airportState", "airportCode")
+  
+  # Add the sentinel entry if not already in the data
+  if (!any(unique_airports$airportName == "Unknown")) {
+    unknown_airport <- data.frame(airportName = "Unknown", airportState = "Unknown", airportCode = "ZZZ")
+    unique_airports <- rbind(unique_airports, unknown_airport)
+  }
+  
+  dbWriteTable(con, "airports", unique_airports, append = TRUE, row.names = FALSE)
+}
+
+## Cache airport IDs
+cache_airport_ids <- function() {
+  airports <- dbGetQuery(con, "SELECT aid, airportName FROM airports")
+  return(airports)
+}
+
+## Cache condition IDs
+cache_condition_ids <- function() {
+  conditions <- dbGetQuery(con, "SELECT cid, sky_condition FROM conditions")
+  return(conditions)
+}
+
+## Function that inserts data into the flights table with bulk insert and cached IDs
+insert_flights <- function(data, airport_cache) {
+  data <- data %>%
+    mutate(isHeavy = ifelse(heavy_flag == "Yes", 1, 0),
+           originAirport = airport_cache$aid[match(dep_airport, airport_cache$airportName)],
+           originAirport = ifelse(is.na(originAirport), unknown_airport_id, originAirport))
+  
+  ## Correct date format- very important
+  data$flight_date <- as.Date(data$flight_date, format = "%m/%d/%y %H:%M")
+  
+  flight_data <- data %>%
+    select(flight_date, originAirport, airline, aircraft, isHeavy) %>%
+    rename(date = flight_date, airlineName = airline, aircraftType = aircraft)
+  
+  # Add sentinel entry if not already in the data
+  if (!any(flight_data$airlineName == "Unknown")) {
+    unknown_airline <- data.frame(date = Sys.Date(), originAirport = unknown_airport_id, airlineName = "Unknown", aircraftType = "Unknown", isHeavy = 0)
+    flight_data <- rbind(flight_data, unknown_airline)
+  }
+  
+  dbWriteTable(con, "flights", flight_data, append = TRUE, row.names = FALSE)
+}
+
+## Function that inserts data into conditions table with dbWriteTable
+insert_conditions <- function(data) {
+  unique_conditions <- unique(data %>% select(sky_conditions))
+  colnames(unique_conditions) <- c("sky_condition")
+  
+  dbWriteTable(con, "conditions", unique_conditions, append = TRUE, row.names = FALSE)
+}
+
+## Function to insert data into the incidents table with bulk insert and cached IDs
+insert_incidents <- function(data, flight_cache, condition_cache) {
+  ## Standardize heavy_flag in the data
+  data <- data %>%
+    mutate(heavy_flag = ifelse(heavy_flag == "Yes", 1, 0))
+
+  ## Ensure date format is correct for matching
+  data$flight_date <- as.Date(data$flight_date, format = "%m/%d/%y %H:%M")
+  flight_cache$date <- as.Date(flight_cache$date)
+
+  ## Construct strings for matching
+  data_strings <- paste(ymd(data$flight_date), data$dep_airport, data$airline, data$aircraft, data$heavy_flag)
+  flight_cache_strings <- paste(ymd(flight_cache$date), flight_cache$airportName, flight_cache$airlineName, flight_cache$aircraftType, flight_cache$isHeavy)
+  
+  ## Print the strings to debug matching
+  print("Data Strings for Matching:")
+  print(head(data_strings))
+  print("Flight Cache Strings for Matching:")
+  print(head(flight_cache_strings))
+  
+  ## Perform the matching and add debug prints
+  data <- data %>%
+    mutate(
+      fid = flight_cache$fid[match(
+        data_strings,
+        flight_cache_strings
+      )],
+      conditions = condition_cache$cid[match(sky_conditions, condition_cache$sky_condition)]
+    )
+  
+  ## Print the data to check if fid and conditions are correctly matched
+  print("Data after matching fid and conditions:")
+  print(head(data))
+  
+  ## Check for rows with NA fid before filtering
+  na_fid_rows <- data %>% filter(is.na(fid))
+  print("Rows with NA fid:")
+  print(head(na_fid_rows))
+  
+  ## Filter out rows with NA fid
+  data <- data %>% filter(!is.na(fid))
+  
+  ## Print the data after filtering NA fid
+  print("Data after filtering NA fid:")
+  print(head(data))
+  
+  incident_data <- data %>%
+    select(fid, wildlife_size, impact, altitude_ft, conditions) %>%
+    rename(wlsize = wildlife_size, altitude = altitude_ft)
+  
+  ## Print final incident data before insertion
+  print("Final Incident Data:")
+  print(head(incident_data))
+  
+  ## Write data to incidents table
+  dbWriteTable(con, "incidents", incident_data, append = TRUE, row.names = FALSE)
+}
+
+## Start transaction
+dbExecute(con, "START TRANSACTION")
+
+## Insert Data into Tables
+insert_airports(bds.raw)
+airport_cache <- cache_airport_ids()
+insert_flights(bds.raw, airport_cache)
+insert_conditions(bds.raw)
+condition_cache <- cache_condition_ids()
+flight_cache <- dbGetQuery(con, "SELECT fid, date, airportName, airlineName, aircraftType, isHeavy FROM flights LEFT JOIN airports ON flights.originAirport = airports.aid")
+print("Flight Cache Data:")
+print(head(flight_cache))
+insert_incidents(bds.raw, flight_cache, condition_cache)
+
+## Commit transaction
+dbExecute(con, "COMMIT")
+```
+## Task7 Reconnect to the database to verify data
+
+```{r verify_task6, echo=FALSE, eval = F, warning = F}
+
+# Verify airports data
+airports_data <- dbGetQuery(con, "SELECT * FROM airports LIMIT 10")
+print(airports_data)
+
+# Verify flights data
+flights_data <- dbGetQuery(con, "SELECT * FROM flights LIMIT 10")
+print(flights_data)
+
+# Verify conditions data
+conditions_data <- dbGetQuery(con, "SELECT * FROM conditions LIMIT 10")
+print(conditions_data)
+
+# Verify incidents data
+incidents_data <- dbGetQuery(con, "SELECT * FROM incidents LIMIT 10")
+print(incidents_data)
+```
+
+## Task8- Top Airlines with Strikes
+
+```{r topAirlinesWithStrikes, eval=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Query to find top 5 airlines with the greatest number of wildlife strike incidents
+top_airlines_query <- "
+SELECT airlineName, COUNT(*) AS incident_count
+FROM flights
+JOIN incidents ON flights.fid = incidents.fid
+GROUP BY airlineName
+ORDER BY incident_count DESC
+LIMIT 5
+"
+
+# Execute the query and fetch the results
+top_airlines <- dbGetQuery(con, top_airlines_query)
+print("Top 5 airlines with the greatest number of wildlife strike incidents:")
+print(top_airlines)
+```
+
+## Task 9: Analysis by Airport
+
+```{r analysisByAirport, eval=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Create a single SQL query to find airports with above-average incidents
+above_average_airports_query <- "
+SELECT airports.airportName, incident_counts.incident_count
+FROM (
+  SELECT originAirport, COUNT(*) AS incident_count
+  FROM flights
+  JOIN incidents ON flights.fid = incidents.fid
+  GROUP BY originAirport
+) AS incident_counts
+JOIN airports ON incident_counts.originAirport = airports.aid
+WHERE incident_counts.incident_count > (
+  SELECT AVG(incident_count) 
+  FROM (
+    SELECT originAirport, COUNT(*) AS incident_count
+    FROM flights
+    JOIN incidents ON flights.fid = incidents.fid
+    GROUP BY originAirport
+  ) AS subquery
+)
+ORDER BY incident_counts.incident_count DESC
+LIMIT 5
+"
+
+# Execute the query and fetch the results
+above_average_airports <- dbGetQuery(con, above_average_airports_query)
+above_average_airports
+
+```
+## Task 10: Analysis by Year
+```{r analysisByYear, echo=FALSE, warning=FALSE, message=FALSE, eval=TRUE}
+# Load required libraries
+if (!requireNamespace("kableExtra", quietly = TRUE)) {
+  install.packages("kableExtra")
+}
+library(kableExtra)
+
+# Query to find the total number of wildlife strikes per year
+strikes_per_year_query <- "
+SELECT YEAR(date) AS year, COUNT(*) AS total_strikes
+FROM flights
+JOIN incidents ON flights.fid = incidents.fid
+GROUP BY year
+ORDER BY year
+"
+
+# Execute the query and save the result in a dataframe
+strikes_per_year <- dbGetQuery(con, strikes_per_year_query)
+
+# Format the result with appropriate table headers using kableExtra
+kable(strikes_per_year, col.names = c("Year", "Total Strikes")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+## Task 11: Trend By Year:
+```{r trendByYear, echo=FALSE, warning=FALSE, message=FALSE, eval=TRUE}
+# Load required libraries
+if (!requireNamespace("kableExtra", quietly = TRUE)) {
+  install.packages("kableExtra")
+}
+if (!requireNamespace("lubridate", quietly = TRUE)) {
+  install.packages("lubridate")
+}
+library(kableExtra)
+library(lubridate)
+
+# Format result with table headers using kableExtra
+kable(strikes_per_year, col.names = c("Year", "Total Strikes")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Build line chart
+plot(
+  strikes_per_year$year,
+  strikes_per_year$total_strikes,
+  type = "o", # Line type with points
+  col = "blue", # Line color
+  xlab = "Year", # X-axis label
+  ylab = "Total Strikes", # Y-axis label
+  main = "Trend of Wildlife Strikes by Year", # Main title
+  xaxt = "n" # Suppress default x-axis
+)
+
+# Add custom x-axis with yearly intervals
+axis(1, at = strikes_per_year$year, labels = strikes_per_year$year)
+
+# Add data labels
+text(
+  strikes_per_year$year,
+  strikes_per_year$total_strikes,
+  labels = strikes_per_year$total_strikes,
+  pos = 3, # Position above the points
+  cex = 0.8, # Text size
+  col = "red" # Text color
+)
+
+# Add a legend
+legend(
+  "topright",
+  legend = "Total Strikes",
+  col = "blue",
+  lty = 1, # Line type
+  pch = 1, # Point type
+  cex = 0.8 # Text size
+)
+```
+## Task 12: Stored Procedure- Wildlife Incident Update
+```{r incidentUpdate, echo=FALSE, warning=FALSE, message=FALSE, eval=TRUE}
+
+
+## Task 12: Create and Test Stored Procedure
+
+# Create the update_log table if it does not exist
+dbExecute(con, "
+CREATE TABLE IF NOT EXISTS update_log (
+    log_id INT PRIMARY KEY AUTO_INCREMENT,
+    modification_type VARCHAR(50),
+    table_name VARCHAR(50),
+    modification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    original_fid INT,
+    original_wlsize TEXT,
+    original_impact TEXT,
+    original_altitude INT,
+    original_conditions INT
+);
+")
+
+# Drop the stored procedure if it exists and create a new one for updating incidents
+dbExecute(con, "DROP PROCEDURE IF EXISTS update_incident;")
+dbExecute(con, "
+CREATE PROCEDURE update_incident(
+    IN p_iid INT,
+    IN p_wlsize TEXT,
+    IN p_impact TEXT,
+    IN p_altitude INT,
+    IN p_conditions INT
+)
+BEGIN
+    DECLARE v_fid INT;
+    DECLARE v_wlsize TEXT;
+    DECLARE v_impact TEXT;
+    DECLARE v_altitude INT;
+    DECLARE v_conditions INT;
+
+    -- Get the original values
+    SELECT fid, wlsize, impact, altitude, conditions
+    INTO v_fid, v_wlsize, v_impact, v_altitude, v_conditions
+    FROM incidents
+    WHERE iid = p_iid;
+
+    -- Insert into the log table
+    INSERT INTO update_log (modification_type, table_name, original_fid, original_wlsize, original_impact, original_altitude, original_conditions)
+    VALUES ('update', 'incidents', v_fid, v_wlsize, v_impact, v_altitude, v_conditions);
+
+    -- Update the incident
+    UPDATE incidents
+    SET wlsize = p_wlsize, impact = p_impact, altitude = p_altitude, conditions = p_conditions
+    WHERE iid = p_iid;
+END;
+")
+
+# Call the stored procedure to update a strike
+dbExecute(con, "CALL update_incident(1, 'Large', 'Destroyed', 2000, 2)")
+
+# Verify the update_log
+update_log <- dbGetQuery(con, "SELECT * FROM update_log WHERE original_fid = 1 ORDER BY modification_time DESC LIMIT 1")
+print("Update Log:")
+print(update_log)
+
+# Verify the updated incident in the incidents table
+updated_incident <- dbGetQuery(con, "SELECT * FROM incidents WHERE iid = 1")
+print("Updated Incident:")
+print(updated_incident)
+
+# Close the connection
+dbDisconnect(con)
+
+```

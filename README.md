@@ -43,7 +43,7 @@ update_incident(...) stored procedure logs all updates to the incidents table by
 
 AnalyzeData.RiggleD.Rmd – R Notebook containing all schema creation, data ingestion, queries, visualizations, and stored procedure logic.
 
-[.nb.html (coming soon)](https://davidcalef.github.io/Relational_DB_Implementation/) – Rendered HTML version of the R Notebook for easy viewing.
+(https://davidcalef.github.io/Relational_DB_Implementation/) – Rendered HTML version of the R Notebook for easy viewing.
 
 ✅ How to View or Run
 
